@@ -86,21 +86,23 @@ void sort_large_group(T* values, std::size_t n, Stamp stamp, std::vector<T>& scr
 }
 
 struct TimedClick { Key id; Id ts,campaign; };
-template<bool narrow> void aggregate(std::vector<Event>& events,std::vector<Click>& clicks,
+template<bool narrow> void aggregate(std::vector<Worker>& workers,std::size_t shard,
                                     const Catalog& cat,const Keys& keys,const Values& values,
                                     UserOutput& users,CampaignDays& totals) {
     auto time=[&](Id code)->I64 {
         if constexpr(narrow) return values.base+code;
         return values.time(code);
     };
-    KeyIndex index(events.size()/24,std::countr_zero(shards));
+    std::size_t total_events=0;
+    for (auto& w:workers) total_events+=w.events[shard].size();
+    KeyIndex index(total_events/24,std::countr_zero(shards));
     std::vector<Group> groups;
-    for (auto& e:events) {
+    for (auto& w:workers) for (auto& e:w.events[shard]) {
         auto [id,added]=index.insert(e.person,groups.size());
         if (added) groups.push_back({e.person});
         ++groups[*id].events; e.person=*id;
     }
-    for (auto& c:clicks) {
+    for (auto& w:workers) for (auto& c:w.clicks[shard]) {
         Id id=index.get(c.person);
         if (id!=absent) ++groups[id].clicks;
         c.person=id;
@@ -112,10 +114,14 @@ template<bool narrow> void aggregate(std::vector<Event>& events,std::vector<Clic
     }
     auto ordered_events=std::make_unique_for_overwrite<std::uint64_t[]>(event_count);
     auto ordered_clicks=std::make_unique_for_overwrite<TimedClick[]>(click_count);
-    for (const auto& e:events)
-        ordered_events[groups[e.person].event_end++]=(std::uint64_t(e.ts)<<32)|e.sale;
-    for (const auto& c:clicks) if (c.person!=absent)
-        ordered_clicks[groups[c.person].click_end++]={c.id,c.ts,c.campaign};
+    for (auto& w:workers) {
+        for (const auto& e:w.events[shard])
+            ordered_events[groups[e.person].event_end++]=(std::uint64_t(e.ts)<<32)|e.sale;
+        for (const auto& c:w.clicks[shard]) if (c.person!=absent)
+            ordered_clicks[groups[c.person].click_end++]={c.id,c.ts,c.campaign};
+        std::vector<Event>{}.swap(w.events[shard]);
+        std::vector<Click>{}.swap(w.clicks[shard]);
+    }
     std::vector<std::uint64_t> event_scratch;
     std::vector<TimedClick> click_scratch;
     auto event_stamp=[](std::uint64_t e){return Id(e>>32);};
@@ -204,12 +210,10 @@ void run(const fs::path& data, const fs::path& out, int n) {
     for (int i = 0; i < n; ++i)
         writers.emplace_back(std::make_unique<UserOutput>(out / "user_daily" / ("part-" + std::to_string(i) + ".parquet")));
     parallel(shards, n, [&](int owner, std::size_t shard) {
-        auto ev = collect(workers, shard, &Worker::events);
-        auto cl = collect(workers, shard, &Worker::clicks);
         auto fn=parsed.values.narrow ? aggregate<true> : aggregate<false>;
-        fn(ev,cl,catalog,parsed.keys,parsed.values,*writers[owner],campaign_days[owner]);
+        fn(workers,shard,catalog,parsed.keys,parsed.values,*writers[owner],campaign_days[owner]);
     });
-    for (auto& writer : writers) writer->close();
+    parallel(writers.size(),n,[&](int,std::size_t i){writers[i]->close();});
     SparseTotals totals;
     for (auto& slice:campaign_days) slice.merge_into(totals);
     CampaignOutput result(out / "campaign_daily" / "part-0.parquet");
@@ -229,7 +233,12 @@ int main(int argc, char** argv) {
         if (__builtin_cpu_supports("x86-64-v3")) {
             std::error_code ec;
             auto self=fs::read_symlink("/proc/self/exe",ec);
-            if (!ec) { self += "-v3"; execv(self.c_str(),argv); }
+            if (!ec) {
+                if (__builtin_cpu_supports("x86-64-v4")) {
+                    auto v4=self.string()+"-v4"; execv(v4.c_str(),argv);
+                }
+                self += "-v3"; execv(self.c_str(),argv);
+            }
         }
 #endif
         auto data = argc > 1 ? fs::path(argv[1]) : setting("DATA_DIR", "/data");

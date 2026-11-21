@@ -5,7 +5,12 @@
 struct Delimiters { std::uint64_t comma, lf, quote; };
 
 inline Delimiters scan64(const char* p) {
-#ifdef __AVX2__
+#if defined(__AVX512BW__)
+    auto x=_mm512_loadu_si512(p);
+    return {_mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8(',')),
+            _mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8('\n')),
+            _mm512_cmpeq_epi8_mask(x,_mm512_set1_epi8('"'))};
+#elif defined(__AVX2__)
     auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
     auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p+32));
     auto mask = [&](char c) {
