@@ -23,7 +23,7 @@ public:
               std::vector<arrow::ArrayBuilder*> columns)
         : schema_(std::move(schema)), columns_(std::move(columns)) {
         sink_ = value(arrow::io::FileOutputStream::Open(path.string()));
-        auto props = parquet::WriterProperties::Builder().compression(parquet::Compression::SNAPPY)->build();
+        auto props = parquet::WriterProperties::Builder().disable_dictionary()->disable_statistics()->build();
         writer_ = value(parquet::arrow::FileWriter::Open(*schema_, arrow::default_memory_pool(), sink_, props));
     }
     void flush() {

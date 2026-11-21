@@ -5,3 +5,6 @@
 !pipeline.hpp
 !output.hpp
 !main.cpp
+!csv.hpp
+!keys.hpp
+!dates.hpp

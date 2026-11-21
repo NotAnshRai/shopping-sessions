@@ -25,11 +25,11 @@ docker run --rm --platform linux/amd64 --network none --read-only \
 
 ## How it works
 
-- **Linked users.** Union-find resolves transitive links across all files. Each connected component keeps its smallest UTF-8 byte string, including IDs found only in the links.
-- **Events.** A parallel first pass identifies IDs that might repeat. For each candidate, an exact comparison selects the earliest well-formed copy across the entire dataset. An invalid winning copy discards the event. Hash collisions only send more rows through the exact comparison.
-- **Sessions.** The surviving events are partitioned by person and sorted by timestamp. A gap strictly greater than 30 minutes starts a new session. Its UTC start day receives all its events and revenue.
-- **Credit and assists.** A sliding seven-day window tracks eligible clicks. The latest click wins credit, with the smallest click ID breaking timestamp ties. A count for each active campaign gives one assist per campaign per session, including the winner.
-- **Daily results.** Each person and day gets one row. Purchase revenue determines the top category, with byte-order tie breaking. Per-worker campaign totals are merged before writing the campaign table.
+CSV workers scan field boundaries in parallel, validate quotes, and keep the full byte value of every ID. Short ASCII IDs fit in one 64-bit key. Other strings use an exact lookup table. A portable amd64 build is included alongside the x86-64-v3 build.
+
+The workers partition events by event ID. Each partition compares full IDs and ingest times, so an invalid early copy still suppresses a later valid one. A union-find resolves linked users while workers parse the logs. Only aliases that change the canonical name need a lookup entry in the final map.
+
+A second partition assigns each person to one worker. The worker groups that person's events and clicks before sorting by time. A sliding seven-day window determines the winning click and distinct assisting campaigns. Daily totals use the session start date. The output tables are written as Parquet.
 
 [Official rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
 
@@ -45,12 +45,4 @@ The official dev answer has 117,038 user-day rows and 27,400 campaign-day rows. 
 
 ## Verification
 
-The packaged executable passed all 36 official fixtures. Both dev outputs matched the official CSVs exactly, with zero missing rows, extra rows, or duplicate keys.
-
-| Local input | Clicks | Elapsed time | Peak process RSS |
-| --- | ---: | ---: | ---: |
-| 1 million events, seed 1 | 250,000 | 0.20 s | 0.18 GiB |
-| 20 million events, seed 843 | 5 million | 7.57 s | 2.93 GiB |
-| 60 million events, seed 7821 | 15 million | 26.77 s | 6.88 GiB |
-
-Each timing is one local run on eight pinned logical CPUs. The binaries were built in the Dockerfile's pinned amd64 base and run from the final filesystem as UID 1000 with networking disabled and the root mounted read-only. For the 60-million-event input, the generator spilled its intermediate shards to disk to fit the local machine. This generator variant produced byte-identical files to the official generator on the million-event dev set. The larger runs were checked for matching daily session and revenue totals across the two tables. The competition determines the official time on its own hidden inputs.
+The pull-request check builds the scorer image, compares both tables against all official fixtures and the one-million-event dev answers, and times the previous and optimized commits on identical generated practice data. The hidden scorer determines the competition result.
