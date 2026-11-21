@@ -1,7 +1,7 @@
 name: Verify Shopping Sessions
 on:
   pull_request:
-    branches: [main]
+    branches: [main, optimize-shopping-sessions]
 permissions:
   contents: read
 jobs:
@@ -47,13 +47,20 @@ jobs:
         run: |
           set -eu
           cd "$RUNNER_TEMP"
-          curl -fsSL --retry 3 https://codeload.github.com/NotAnshRai/shopping-sessions/tar.gz/bfdc18d28c90a69e8c5d3d46072fc18878be3eb8 | tar -xz
-          docker build -t shopping-old "shopping-sessions-bfdc18d28c90a69e8c5d3d46072fc18878be3eb8"
+          base="${{ github.event.pull_request.base.sha }}"
+          curl -fsSL --retry 3 "https://codeload.github.com/NotAnshRai/shopping-sessions/tar.gz/$base" | tar -xz
+          docker build -t shopping-old "shopping-sessions-$base"
           generator/target/release/generate --seed 843 --events 20000000 --clicks 5000000 --output practice
-          for image in shopping-old shopping-ci; do
-            mkdir "out-$image"
-            for rep in 1 2 3; do
-              /usr/bin/time -f "$image trial $rep wall %e s" docker run --rm --network none --read-only --user "$(id -u):$(id -g)" -e NCPU="$(nproc)" -v "$PWD/practice:/data:ro" -v "$PWD/out-$image:/output" "$image"
+          mkdir out-shopping-old out-shopping-ci
+          echo "Benchmark runner exposes $(nproc) logical CPUs"
+          for rep in 1 2 3; do
+            order="shopping-old shopping-ci"
+            if [ "$rep" = 2 ]; then order="shopping-ci shopping-old"; fi
+            for image in $order; do
+              name="$image-$rep"
+              docker run --name "$name" --network none --read-only --user "$(id -u):$(id -g)" -e NCPU="$(nproc)" -v "$PWD/practice:/data:ro" -v "$PWD/out-$image:/output" "$image"
+              docker inspect "$name" --format '{{json .State}}' | python3 -c 'import datetime as d,json,sys; s=json.load(sys.stdin); a,b=(d.datetime.fromisoformat(s[k].replace("Z","+00:00")) for k in ("StartedAt","FinishedAt")); print(sys.argv[1],"container wall seconds",(b-a).total_seconds())' "$name"
+              docker rm "$name" >/dev/null
             done
           done
           verify-env/bin/python starter-duckdb/scripts/compare.py out-shopping-old out-shopping-ci

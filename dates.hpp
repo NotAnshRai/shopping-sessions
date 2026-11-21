@@ -11,6 +11,17 @@ class Dates {
     template<class T> static T load(const char* p) {
         T v; std::memcpy(&v,p,sizeof v); return v;
     }
+    static bool decimal_word(std::uint64_t v) {
+        constexpr std::uint64_t hi=0xf0f0f0f0f0f0f0f0ULL, low=~hi;
+        return (v&hi)==0x3030303030303030ULL &&
+               !(((v&low)+0x0606060606060606ULL)&0x1010101010101010ULL);
+    }
+    static unsigned digits8(std::uint64_t v) {
+        v &= 0x0f0f0f0f0f0f0f0fULL;
+        v=(v*10+(v>>8)) & 0x00ff00ff00ff00ffULL;
+        v=(v*100+(v>>16)) & 0x0000ffff0000ffffULL;
+        return unsigned(v)*10000 + unsigned(v>>32);
+    }
 public:
     explicit Dates(const Window& w) {
         int first=utc_day(w.start)-10, last=std::min(first+95,utc_day(w.end)+8);
@@ -22,6 +33,11 @@ public:
         }
     }
     I64 parse(Text s) const {
+        if (s.size()==13) {
+            auto a=load<std::uint64_t>(s.data()), b=load<std::uint64_t>(s.data()+5);
+            if (!decimal_word(a) || !decimal_word(b)) return bad_time;
+            return I64(digits8(a)/1000)*100000000+digits8(b);
+        }
         if (s.size()!=20 && s.size()!=25) return timestamp(s);
         auto& d=dates_[slot(s.data())];
         if (!d.prefix || load<std::uint64_t>(s.data())!=d.prefix || load<std::uint16_t>(s.data()+8)!=d.suffix)
