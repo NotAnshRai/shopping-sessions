@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!build.sh
+!input.hpp
+!pipeline.hpp
+!output.hpp
+!main.cpp
