@@ -1,7 +1,7 @@
 name: Verify Shopping Sessions
 on:
   pull_request:
-    branches: [main]
+    branches: [main, optimize-shopping-sessions]
 permissions:
   contents: read
 jobs:
