@@ -9,3 +9,4 @@ compile() {
 }
 compile -DSELECT_NATIVE_SOLVER "$output"
 compile -march=x86-64-v3 "$output-v3"
+compile -march=x86-64-v4 "$output-v4"

@@ -39,12 +39,13 @@ public:
 class UserOutput {
     arrow::StringBuilder name_, category_;
     arrow::Date32Builder day_;
-    arrow::Int64Builder sessions_, events_, revenue_;
+    arrow::UInt32Builder sessions_, events_;
+    arrow::Int64Builder revenue_;
     BatchFile file_;
 public:
     explicit UserOutput(const fs::path& path) : file_(path, arrow::schema({
         arrow::field("user_id", arrow::utf8()), arrow::field("day", arrow::date32()),
-        arrow::field("sessions", arrow::int64()), arrow::field("events", arrow::int64()),
+        arrow::field("sessions", arrow::uint32()), arrow::field("events", arrow::uint32()),
         arrow::field("revenue_cents", arrow::int64()), arrow::field("top_category", arrow::utf8())}),
         {&name_, &day_, &sessions_, &events_, &revenue_, &category_}) {}
     void add(Text person, int day, I64 sessions, I64 events, I64 revenue, const Text* category) {

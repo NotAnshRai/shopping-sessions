@@ -1,7 +1,7 @@
 name: Verify Shopping Sessions
 on:
   pull_request:
-    branches: [main, optimize-shopping-sessions]
+    branches: [main, optimize-shopping-sessions, tune-session-groups]
 permissions:
   contents: read
 jobs:
@@ -43,6 +43,16 @@ jobs:
           mkdir out-dev
           ./run-solver dev out-dev
           verify-env/bin/python starter-duckdb/scripts/compare.py out-dev dev-answer
+      - name: Compare vector and scalar decoders at block boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in x86-64 x86-64-v3 x86-64-v4; do
+            if [[ "$arch" == x86-64-v3 ]] && ! grep -qw avx2 /proc/cpuinfo; then continue; fi
+            if [[ "$arch" == x86-64-v4 ]] && ! grep -qw avx512bw /proc/cpuinfo; then continue; fi
+            g++ -I. -O2 -std=c++20 -march="$arch" tests/validate_fast_paths.cpp -o "$RUNNER_TEMP/validate"
+            "$RUNNER_TEMP/validate" "$RUNNER_TEMP/dev/manifest.json"
+          done
       - name: Compare old and new on twenty million events
         run: |
           set -eu

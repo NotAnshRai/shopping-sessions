@@ -115,26 +115,58 @@ struct Values {
 struct Event { Key person; Id ts,sale; };
 struct Click { Key person,id; Id ts,campaign; };
 struct Candidate { Key id; I64 ingest; Event event; };
+// Allocate the event-ID buckets in large worker-private slabs. Bucket growth
+// only appends a pointer, so previously seen candidates never move.
+class CandidateArena {
+    static constexpr std::size_t slab_bytes=16u<<20;
+    std::vector<void*> slabs_;
+    std::size_t used_=slab_bytes;
+public:
+    static constexpr std::size_t block_rows=512;
+    CandidateArena()=default;
+    CandidateArena(const CandidateArena&)=delete;
+    ~CandidateArena() { release(); }
+    void release() {
+        for (void* slab:slabs_) munmap(slab,slab_bytes);
+        slabs_.clear(); used_=slab_bytes;
+    }
+    Candidate* block() {
+        constexpr std::size_t bytes=sizeof(Candidate)*block_rows;
+        if (slab_bytes-used_<bytes) {
+            void* slab=mmap(nullptr,slab_bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+            if (slab==MAP_FAILED) throw std::bad_alloc();
+            madvise(slab,slab_bytes,MADV_HUGEPAGE);
+            slabs_.push_back(slab);
+            used_=0;
+        }
+        auto* p=static_cast<std::byte*>(slabs_.back())+used_;
+        used_+=bytes;
+        return ::new (p) Candidate[block_rows];
+    }
+};
+
+class CandidateBucket {
+    std::vector<Candidate*> blocks_;
+    std::size_t rows_=0;
+public:
+    void append(CandidateArena& arena,Candidate row) {
+        auto pos=rows_%CandidateArena::block_rows;
+        if (!pos) blocks_.push_back(arena.block());
+        blocks_.back()[pos]=row;
+        ++rows_;
+    }
+    std::size_t size() const { return rows_; }
+    Candidate& operator[](std::size_t i) const {
+        return blocks_[i/CandidateArena::block_rows][i%CandidateArena::block_rows];
+    }
+};
 struct Worker {
     std::array<std::vector<Event>,shards> events;
     std::array<std::vector<Click>,shards> clicks;
-    std::array<std::vector<Candidate>,id_shards> candidates;
+    CandidateArena arena;
+    std::array<CandidateBucket,id_shards> candidates;
     std::vector<std::pair<Key,Key>> links;
 };
-
-template<class T,std::size_t N> std::vector<T> collect(std::vector<Worker>& workers,std::size_t b,
-                                                     std::array<std::vector<T>,N> Worker::*member) {
-    std::size_t n=0;
-    for (auto& w:workers) n+=(w.*member)[b].size();
-    std::vector<T> result;
-    result.reserve(n);
-    for (auto& w:workers) {
-        auto& part=(w.*member)[b];
-        result.insert(result.end(),part.begin(),part.end());
-        std::vector<T>{}.swap(part);
-    }
-    return result;
-}
 
 struct Parsed {
     std::vector<Worker> workers;
@@ -153,11 +185,9 @@ struct Parsed {
         // Other workers may intern new strings while the link task runs.
         const auto link_strings=keys.overflow();
         auto events=files.add(path/"events"), clicks=files.add(path/"clicks");
-        std::size_t event_bytes=0,click_bytes=0;
-        for (auto s:events) event_bytes+=s.size();
+        std::size_t click_bytes=0;
         for (auto s:clicks) click_bytes+=s.size();
         for (auto& local:workers) {
-            for (auto& bin:local.candidates) bin.reserve(event_bytes/(73ULL*n*id_shards));
             for (auto& bin:local.clicks) bin.reserve(click_bytes/(38ULL*n*shards));
         }
         parallel(1+events.size()+clicks.size(),n,[&](int owner,std::size_t j){
@@ -180,7 +210,7 @@ struct Parsed {
                         }
                     } else if (f[4]!="view" && f[4]!="cart") valid=false;
                     if (valid) { e.person=keys.encode(f[1]); e.ts=values.stamp(ts,owner); }
-                    workers[owner].candidates[mix(id)%id_shards].push_back({id,ingest,e});
+                    workers[owner].candidates[mix(id)%id_shards].append(workers[owner].arena,{id,ingest,e});
                 });
             } else {
                 csv_rows<4>(clicks[j-events.size()],[&](auto& f){
@@ -211,8 +241,8 @@ struct Parsed {
             for (auto& w:workers) count+=w.candidates[b].size();
             auto capacity=std::bit_ceil(std::max<std::size_t>(8,count+count/2));
             std::vector<std::uint64_t> slots(capacity);
-            std::array<Candidate*,8> first{};
-            for (std::size_t t=0;t<workers.size();++t) first[t]=workers[t].candidates[b].data();
+            std::array<CandidateBucket*,8> first{};
+            for (std::size_t t=0;t<workers.size();++t) first[t]=&workers[t].candidates[b];
             for (unsigned t=0;t<workers.size();++t) {
                 auto& part=workers[t].candidates[b];
                 for (Id i=0;i<part.size();++i) {
@@ -225,7 +255,7 @@ struct Parsed {
                         if (!old) { slots[slot]=value; break; }
                         if (((old^value)>>32)==0) {
                             Id ref=Id(old)-1;
-                            auto& prior=first[ref%8][ref/8];
+                            auto& prior=(*first[ref%8])[ref/8];
                             if (prior.id==row.id) {
                                 if (row.ingest<prior.ingest) { prior.event.person=0; slots[slot]=value; }
                                 else row.event.person=0;
@@ -245,9 +275,9 @@ struct Parsed {
                     e.person=people->canonical(e.person);
                     sorted[owner].events[mix(e.person)%shards].push_back(e);
                 }
-                std::vector<Candidate>{}.swap(part);
             }
         });
+        parallel(workers.size(),workers.size(),[&](int,std::size_t i){workers[i].arena.release();});
         parallel(shards,workers.size(),[&](int owner,std::size_t b){
             for (auto& w:workers) {
                 auto& part=w.clicks[b];
