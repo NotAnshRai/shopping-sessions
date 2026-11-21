@@ -52,17 +52,38 @@ template<std::size_t N,class F> void csv_rows(Text input, F&& process) {
             auto d0=lo.comma, d1=hi.comma;
             if (len<64) d0 |= std::uint64_t(1)<<len;
             else d1 |= std::uint64_t(1)<<(len-64);
-            auto edges0=(d0<<1) | 1 | (d0>>1) | (d1<<63);
-            auto edges1=(d1<<1) | (d0>>63) | (d1>>1);
-            bool valid=!(lo.quote & ~edges0) && !(hi.quote & ~edges1);
+            auto starts0=(d0<<1)|1, starts1=(d1<<1)|(d0>>63);
+            auto ends0=(d0>>1)|(d1<<63), ends1=d1>>1;
+            bool valid=!(lo.quote & ~(starts0|ends0)) && !(hi.quote & ~(starts1|ends1));
+#ifdef __BMI2__
+            unsigned trim=0;
+            if (lo.quote || hi.quote) {
+                // Fold the quote bits at the start and end of each field into
+                // two ordered bitsets. A quoted field needs two distinct quotes.
+                auto after0=(lo.quote>>1)|(hi.quote<<63), after1=hi.quote>>1;
+                auto before0=lo.quote<<1, before1=(hi.quote<<1)|(lo.quote>>63);
+                unsigned open=unsigned(lo.quote&1) | (unsigned(_pext_u64(after0,lo.comma))<<1)
+                    | (unsigned(_pext_u64(after1,hi.comma))<<(1+std::popcount(lo.comma)));
+                unsigned close=unsigned(_pext_u64(before0,d0)) |
+                    (unsigned(_pext_u64(before1,d1))<<std::popcount(d0));
+                valid=valid && open==close && !(lo.quote&starts0&ends0) && !(hi.quote&starts1&ends1);
+                trim=open;
+            }
+            if (!valid) { p+=len+1; continue; }
+#endif
             unsigned at=0;
             for (unsigned j=0; j<N; ++j) {
                 unsigned last;
                 if (d0) { last=std::countr_zero(d0); d0 &= d0-1; }
                 else { last=64+std::countr_zero(d1); d1 &= d1-1; }
+#ifdef __BMI2__
+                unsigned q=(trim>>j)&1;
+                fields_out[j]=Text(p+at+q,last-at-2*q);
+#else
                 bool open=p[at]=='"', close=last>at && p[last-1]=='"';
                 if (open!=close || (open && last-at<2)) { valid=false; break; }
                 fields_out[j]=Text(p+at+open,last-at-open-close);
+#endif
                 at=last+1;
             }
             if (valid) process(fields_out);

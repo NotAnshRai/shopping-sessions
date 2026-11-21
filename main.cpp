@@ -55,6 +55,37 @@ struct Group {
     Id events=0,clicks=0,event_end=0,click_end=0;
 };
 
+// High-activity shoppers can have hundreds of thousands of rows. Stable byte
+// passes avoid repeatedly comparing timestamps in those individual groups.
+template<class T,class Stamp>
+void sort_large_group(T* values, std::size_t n, Stamp stamp, std::vector<T>& scratch) {
+    std::array<std::array<std::size_t,256>,4> counts{};
+    Id different=0, first=stamp(values[0]);
+    for (std::size_t i=0;i<n;++i) {
+        Id ts=stamp(values[i]);
+        different |= ts^first;
+        for (unsigned b=0;b<4;++b) ++counts[b][(ts>>(8*b))&255];
+    }
+    if (!different) return;
+    scratch.resize(n);
+    T* src=values;
+    T* dest=scratch.data();
+    for (unsigned b=0;b<4;++b) {
+        if (!((different>>(8*b))&255)) continue;
+        std::size_t pos=0;
+        for (auto& slot:counts[b]) {
+            auto amount=slot; slot=pos; pos+=amount;
+        }
+        for (std::size_t i=0;i<n;++i) {
+            unsigned digit=(stamp(src[i])>>(8*b))&255;
+            dest[counts[b][digit]++]=src[i];
+        }
+        std::swap(src,dest);
+    }
+    if (src!=values) std::copy_n(src,n,values);
+}
+
+struct TimedClick { Key id; Id ts,campaign; };
 template<bool narrow> void aggregate(std::vector<Event>& events,std::vector<Click>& clicks,
                                     const Catalog& cat,const Keys& keys,const Values& values,
                                     UserOutput& users,CampaignDays& totals) {
@@ -79,26 +110,34 @@ template<bool narrow> void aggregate(std::vector<Event>& events,std::vector<Clic
         g.event_end=event_count; g.click_end=click_count;
         event_count+=g.events; click_count+=g.clicks;
     }
-    auto ordered_events=std::make_unique_for_overwrite<Event[]>(event_count);
-    auto ordered_clicks=std::make_unique_for_overwrite<Click[]>(click_count);
-    for (auto& e:events) ordered_events[groups[e.person].event_end++]=e;
-    for (auto& c:clicks) if (c.person!=absent) ordered_clicks[groups[c.person].click_end++]=c;
+    auto ordered_events=std::make_unique_for_overwrite<std::uint64_t[]>(event_count);
+    auto ordered_clicks=std::make_unique_for_overwrite<TimedClick[]>(click_count);
+    for (const auto& e:events)
+        ordered_events[groups[e.person].event_end++]=(std::uint64_t(e.ts)<<32)|e.sale;
+    for (const auto& c:clicks) if (c.person!=absent)
+        ordered_clicks[groups[c.person].click_end++]={c.id,c.ts,c.campaign};
+    std::vector<std::uint64_t> event_scratch;
+    std::vector<TimedClick> click_scratch;
+    auto event_stamp=[](std::uint64_t e){return Id(e>>32);};
     ActiveCampaigns active(cat.campaigns.size());
     std::vector<I64> category_sum(cat.categories.size());
     std::vector<Id> touched;
     for (auto& g:groups) {
         auto* ev=ordered_events.get()+(g.event_end-g.events);
         auto* cl=ordered_clicks.get()+(g.click_end-g.clicks);
-        auto earlier=[&](const auto& a,const auto& b) {
-            if constexpr(narrow) return a.ts<b.ts;
-            return time(a.ts)<time(b.ts);
-        };
-        std::sort(ev,ev+g.events,earlier);
-        std::sort(cl,cl+g.clicks,earlier);
+        if constexpr(narrow) {
+            if (g.events>=4096) sort_large_group(ev,g.events,event_stamp,event_scratch);
+            else std::sort(ev,ev+g.events);
+            if (g.clicks>=4096) sort_large_group(cl,g.clicks,[](const TimedClick& c){return c.ts;},click_scratch);
+            else std::sort(cl,cl+g.clicks,[](const TimedClick& a,const TimedClick& b){return a.ts<b.ts;});
+        } else {
+            std::sort(ev,ev+g.events,[&](auto a,auto b){return time(event_stamp(a))<time(event_stamp(b));});
+            std::sort(cl,cl+g.clicks,[&](const auto& a,const auto& b){return time(a.ts)<time(b.ts);});
+        }
         std::size_t ei=0,left=0,right=0,latest=0;
         char buf[9];
         Text person=keys.decode(g.person,buf);
-        int day=utc_day(time(ev[0].ts));
+        int day=utc_day(time(event_stamp(ev[0])));
         I64 sessions=0,events_today=0,revenue=0;
         auto finish_day=[&] {
             Id top=absent;
@@ -111,22 +150,22 @@ template<bool narrow> void aggregate(std::vector<Event>& events,std::vector<Clic
             sessions=events_today=revenue=0;
         };
         do {
-            I64 start=time(ev[ei].ts), last;
+            I64 start=time(event_stamp(ev[ei])), last;
             int new_day=utc_day(start);
             if (day!=new_day) { finish_day(); day=new_day; }
             ++sessions;
             I64 sales=0;
             do {
                 const auto& e=ev[ei++];
-                last=time(e.ts);
+                last=time(event_stamp(e));
                 ++events_today;
-                if (e.sale) {
-                    auto [price,c]=values.unpack(e.sale);
+                if (Id amount=Id(e)) {
+                    auto [price,c]=values.unpack(amount);
                     if (!category_sum[c]) touched.push_back(c);
                     category_sum[c]+=price;
                     sales+=price;
                 }
-            } while (ei<g.events && time(ev[ei].ts)-last<=gap_ms);
+            } while (ei<g.events && time(event_stamp(ev[ei]))-last<=gap_ms);
             revenue+=sales;
             // Identical click copies enter and leave together. Both the set
             // of active campaigns and the minimum click ID at a tie are exact.
