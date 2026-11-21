@@ -1,0 +1,83 @@
+name: Verify Shopping Sessions
+on:
+  pull_request:
+    branches: [main, optimize-shopping-sessions, tune-session-groups]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build the amd64 scorer image
+        run: docker build -t shopping-ci .
+      - name: Download the official checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          for f in starter-duckdb generator dev-answer; do
+            curl --fail --location --retry 3 --silent --show-error "https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/$f.zip" -o "$f.zip"
+            unzip -qo "$f.zip"
+          done
+          python3 -m venv "$RUNNER_TEMP/verify-env"
+          "$RUNNER_TEMP/verify-env/bin/pip" install --quiet 'polars==1.35.2'
+          cargo build --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" --release --locked
+          cat > "$RUNNER_TEMP/run-solver" <<'SH'
+          #!/bin/sh
+          set -eu
+          data=$(realpath "$1")
+          output=$(realpath "$2")
+          docker run --rm --network none --read-only --tmpfs /tmp:size=64m --user "$(id -u):$(id -g)" -e NCPU="$(nproc)" -v "$data:/data:ro" -v "$output:/output" shopping-ci
+          SH
+          chmod +x "$RUNNER_TEMP/run-solver"
+      - name: Compare all official fixtures and the one-million-event dev tables
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          verify-env/bin/python starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- "$RUNNER_TEMP/run-solver"
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+          mkdir out-dev
+          ./run-solver dev out-dev
+          verify-env/bin/python starter-duckdb/scripts/compare.py out-dev dev-answer
+      - name: Compare vector and scalar decoders at block boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in x86-64 x86-64-v3 x86-64-v4; do
+            if [[ "$arch" == x86-64-v3 ]] && ! grep -qw avx2 /proc/cpuinfo; then continue; fi
+            if [[ "$arch" == x86-64-v4 ]] && ! grep -qw avx512bw /proc/cpuinfo; then continue; fi
+            g++ -I. -O2 -std=c++20 -march="$arch" tests/validate_fast_paths.cpp -o "$RUNNER_TEMP/validate"
+            "$RUNNER_TEMP/validate" "$RUNNER_TEMP/dev/manifest.json"
+          done
+      - name: Compare old and new on twenty million events
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          base="${{ github.event.pull_request.base.sha }}"
+          curl -fsSL --retry 3 "https://codeload.github.com/NotAnshRai/shopping-sessions/tar.gz/$base" | tar -xz
+          docker build -t shopping-old "shopping-sessions-$base"
+          generator/target/release/generate --seed 843 --events 20000000 --clicks 5000000 --output practice
+          mkdir out-shopping-old out-shopping-ci
+          echo "Benchmark runner exposes $(nproc) logical CPUs"
+          for rep in 1 2 3; do
+            order="shopping-old shopping-ci"
+            if [ "$rep" = 2 ]; then order="shopping-ci shopping-old"; fi
+            for image in $order; do
+              name="$image-$rep"
+              docker run --name "$name" --network none --read-only --user "$(id -u):$(id -g)" -e NCPU="$(nproc)" -v "$PWD/practice:/data:ro" -v "$PWD/out-$image:/output" "$image"
+              docker inspect "$name" --format '{{json .State}}' | python3 -c 'import datetime as d,json,sys; s=json.load(sys.stdin); a,b=(d.datetime.fromisoformat(s[k].replace("Z","+00:00")) for k in ("StartedAt","FinishedAt")); print(sys.argv[1],"container wall seconds",(b-a).total_seconds())' "$name"
+              docker rm "$name" >/dev/null
+            done
+          done
+          verify-env/bin/python starter-duckdb/scripts/compare.py out-shopping-old out-shopping-ci
+      - name: Run the optimized image at final size
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          generator/target/release/generate --seed 7821 --events 60000000 --clicks 15000000 --threads 2 --output final
+          mkdir out-final
+          /usr/bin/time -f "final wall %e s" ./run-solver final out-final

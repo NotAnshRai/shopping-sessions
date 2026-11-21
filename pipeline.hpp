@@ -1,5 +1,7 @@
 #pragma once
-#include "input.hpp"
+#include "keys.hpp"
+#include "csv.hpp"
+#include "dates.hpp"
 #include <numeric>
 
 using Dictionary = std::unordered_map<Text, Id>;
@@ -28,192 +30,265 @@ struct Catalog {
 };
 
 struct People {
-    Dictionary links;
-    std::vector<Text> names;
-    struct Partition { std::mutex mutex; Dictionary ids; };
-    std::array<Partition, 128> singletons;
-    std::atomic<Id> next{0};
-
-    explicit People(const std::vector<Text>& chunks) {
-        std::vector<Id> parent, size, smallest;
-        auto add = [&](Text s) {
-            auto [it, added] = links.try_emplace(s, parent.size());
-            if (added) {
-                Id i = it->second;
-                names.push_back(s); parent.push_back(i); size.push_back(1); smallest.push_back(i);
-            }
-            return it->second;
-        };
-        auto root = [&](Id i) {
-            while (i != parent[i]) { parent[i] = parent[parent[i]]; i = parent[i]; }
-            return i;
-        };
-        for (Text chunk : chunks) lines(chunk, [&](Text line) {
-            std::array<Text, 2> f;
-            if (!fields(line, f) || f[0].empty() || f[1].empty()) return;
-            Id a = root(add(f[0])), b = root(add(f[1]));
-            if (a == b) return;
-            if (size[a] < size[b]) std::swap(a, b);
-            parent[b] = a;
-            size[a] += size[b];
-            if (names[smallest[b]] < names[smallest[a]]) smallest[a] = smallest[b];
-        });
-        for (auto& [s, id] : links) id = smallest[root(id)];
-        next.store(names.size());
+    KeyIndex index;
+    std::vector<Key> names;
+    std::vector<Id> parent,size;
+    struct Alias { Key raw=0,canonical=0; };
+    std::vector<Alias> aliases;
+    std::size_t mask=0;
+    explicit People(std::size_t n) : index(n) {}
+    Id add(Key k) {
+        auto [p,added]=index.insert(k,names.size());
+        if (added) { names.push_back(k); parent.push_back(*p); size.push_back(1); }
+        return *p;
     }
-    Id resolve(Text s, std::size_t hash) {
-        const auto& linked = std::as_const(links);
-        auto found = linked.find(s);
-        if (found != linked.end()) return found->second;
-        auto& part = singletons[hash % singletons.size()];
-        std::lock_guard lock(part.mutex);
-        auto [it, added] = part.ids.try_emplace(s, 0);
-        if (added) it->second = next.fetch_add(1, std::memory_order_relaxed);
-        return it->second;
+    Id root(Id i) {
+        while (i!=parent[i]) { parent[i]=parent[parent[i]]; i=parent[i]; }
+        return i;
+    }
+    void link(Key ka,Key kb,const std::vector<Text>& overflow) {
+        Id a=root(add(ka)), b=root(add(kb));
+        if (a==b) return;
+        if (size[a]<size[b]) std::swap(a,b);
+        parent[b]=a; size[a]+=size[b];
+        if (Keys::less(names[b],names[a],overflow)) names[a]=names[b];
     }
     void finish() {
-        names.resize(next.load());
-        for (auto& part : singletons) {
-            for (auto [s, id] : part.ids) names[id] = s;
-            Dictionary{}.swap(part.ids);
+        for (Id i=0; i<names.size(); ++i) names[i]=names[root(i)];
+        std::size_t count=0;
+        index.each([&](Key k,Id i){ count+=k!=names[i]; });
+        aliases.resize(std::bit_ceil(std::max<std::size_t>(8,count*2)));
+        mask=aliases.size()-1;
+        index.each([&](Key k,Id i){
+            if (k==names[i]) return;
+            auto slot=mix(k)&mask;
+            while (aliases[slot].raw) slot=(slot+1)&mask;
+            aliases[slot]={k,names[i]};
+        });
+        index=KeyIndex{};
+        std::vector<Key>{}.swap(names);
+        std::vector<Id>{}.swap(parent);
+        std::vector<Id>{}.swap(size);
+    }
+    void prefetch(Key k) const { __builtin_prefetch(&aliases[mix(k)&mask]); }
+    Key canonical(Key k) const {
+        auto slot=mix(k)&mask;
+        while (aliases[slot].raw) {
+            if (aliases[slot].raw==k) return aliases[slot].canonical;
+            slot=(slot+1)&mask;
         }
-        Dictionary{}.swap(links);
+        return k;
     }
 };
 
-// The first atomic OR linearizes concurrent copies. The second filter marks all
-// potential duplicates. False positives only send additional rows to the exact
-// reducer, where complete event IDs and ingest times decide the winner.
-class DuplicateFilter {
-    using Word = std::atomic<std::uint64_t>;
-    std::size_t size_;
-    std::unique_ptr<Word[]> seen_, suspects_;
-    static std::uint64_t bits(std::size_t h) {
-        return (1ULL << ((h >> 32) & 63)) | (1ULL << ((h >> 40) & 63)) | (1ULL << ((h >> 48) & 63));
+constexpr unsigned shards=128, id_shards=256;
+struct Sale { Id price,category; };
+struct Values {
+    static constexpr Id external=Id{1}<<31;
+    struct Overflow { std::vector<I64> times; std::vector<Sale> sales; };
+    std::array<Overflow,8> overflow;
+    I64 base;
+    bool narrow;
+    explicit Values(const Window& w) : base(w.start-week_ms), narrow(w.end-base<=external) {}
+    Id stamp(I64 ts,unsigned worker) {
+        auto offset=std::uint64_t(ts-base);
+        if (offset<external) return Id(offset);
+        auto& v=overflow[worker].times;
+        Id id=external | Id(v.size()*8+worker);
+        v.push_back(ts); return id;
     }
+    I64 time(Id code) const {
+        if (code<external) return base+code;
+        return overflow[code%8].times[(code^external)/8];
+    }
+    Id sale(Id price,Id category,unsigned worker) {
+        if (category<128) return (category<<24)|price;
+        auto& v=overflow[worker].sales;
+        Id id=external | Id(v.size()*8+worker);
+        v.push_back({price,category}); return id;
+    }
+    Sale unpack(Id v) const {
+        if (v<external) return {v & 0xffffffu,v>>24};
+        return overflow[v%8].sales[(v^external)/8];
+    }
+};
+struct Event { Key person; Id ts,sale; };
+struct Click { Key person,id; Id ts,campaign; };
+struct Candidate { Key id; I64 ingest; Event event; };
+// Allocate the event-ID buckets in large worker-private slabs. Bucket growth
+// only appends a pointer, so previously seen candidates never move.
+class CandidateArena {
+    static constexpr std::size_t slab_bytes=16u<<20;
+    std::vector<void*> slabs_;
+    std::size_t used_=slab_bytes;
 public:
-    explicit DuplicateFilter(std::size_t bytes)
-        : size_(std::bit_ceil(std::clamp<std::size_t>(bytes / 400, 64, 1u << 25))),
-          seen_(std::make_unique<Word[]>(size_)), suspects_(std::make_unique<Word[]>(size_)) {}
-    void observe(std::size_t h) {
-        auto i = h & (size_ - 1), mask = bits(h);
-        if ((seen_[i].fetch_or(mask, std::memory_order_relaxed) & mask) == mask)
-            suspects_[i].fetch_or(mask, std::memory_order_relaxed);
+    static constexpr std::size_t block_rows=512;
+    CandidateArena()=default;
+    CandidateArena(const CandidateArena&)=delete;
+    ~CandidateArena() { release(); }
+    void release() {
+        for (void* slab:slabs_) munmap(slab,slab_bytes);
+        slabs_.clear(); used_=slab_bytes;
     }
-    void seal() { seen_.reset(); }
-    bool possible(std::size_t h) const {
-        auto mask = bits(h);
-        return (suspects_[h & (size_ - 1)].load(std::memory_order_relaxed) & mask) == mask;
+    Candidate* block() {
+        constexpr std::size_t bytes=sizeof(Candidate)*block_rows;
+        if (slab_bytes-used_<bytes) {
+            void* slab=mmap(nullptr,slab_bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+            if (slab==MAP_FAILED) throw std::bad_alloc();
+            madvise(slab,slab_bytes,MADV_HUGEPAGE);
+            slabs_.push_back(slab);
+            used_=0;
+        }
+        auto* p=static_cast<std::byte*>(slabs_.back())+used_;
+        used_+=bytes;
+        return ::new (p) Candidate[block_rows];
     }
 };
 
-constexpr unsigned shards = 64;
-struct Event { I64 ts; Id person, price, category; };
-struct Click { Text id; I64 ts; Id person, campaign; };
-struct Candidate { Text id; I64 ingest; Event event; };
-
+class CandidateBucket {
+    std::vector<Candidate*> blocks_;
+    std::size_t rows_=0;
+public:
+    void append(CandidateArena& arena,Candidate row) {
+        auto pos=rows_%CandidateArena::block_rows;
+        if (!pos) blocks_.push_back(arena.block());
+        blocks_.back()[pos]=row;
+        ++rows_;
+    }
+    std::size_t size() const { return rows_; }
+    Candidate& operator[](std::size_t i) const {
+        return blocks_[i/CandidateArena::block_rows][i%CandidateArena::block_rows];
+    }
+};
 struct Worker {
-    struct CacheEntry { Text name; Id person; };
-    std::vector<CacheEntry> cache = std::vector<CacheEntry>(8192);
-    std::array<std::vector<Event>, shards> events;
-    std::array<std::vector<Click>, shards> clicks;
-    std::array<std::vector<Candidate>, shards> repeats;
-    Id person(Text user, People& people) {
-        auto h = hash_text(user);
-        auto& slot = cache[h % cache.size()];
-        if (slot.name != user) slot = {user, people.resolve(user, h)};
-        return slot.person;
-    }
+    std::array<std::vector<Event>,shards> events;
+    std::array<std::vector<Click>,shards> clicks;
+    CandidateArena arena;
+    std::array<CandidateBucket,id_shards> candidates;
+    std::vector<std::pair<Key,Key>> links;
 };
 
-inline DuplicateFilter identify_repeats(const std::vector<Text>& chunks, int threads) {
-    std::size_t bytes = 0;
-    for (auto c : chunks) bytes += c.size();
-    DuplicateFilter filter(bytes);
-    parallel(chunks.size(), threads, [&](int, std::size_t i) {
-        lines(chunks[i], [&](Text line) {
-            auto comma = line.find(',');
-            if (comma == Text::npos || comma == 0) return;
-            Text id = line.substr(0, comma);
-            if (id.size() >= 2 && id.front() == '"' && id.back() == '"')
-                id = id.substr(1, id.size() - 2);
-            if (!id.empty()) filter.observe(hash_text(id));
+struct Parsed {
+    std::vector<Worker> workers;
+    Keys keys;
+    Values values;
+    std::unique_ptr<People> people;
+    Parsed(Inputs& files,const fs::path& path,const Window& w,const Catalog& cat,int n) : workers(n),values(w) {
+        Dates dates(w);
+        auto links=files.add(path/"links");
+        parallel(links.size(),n,[&](int owner,std::size_t j) {
+            csv_rows<2>(links[j],[&](auto& f){
+                if (!f[0].empty() && !f[1].empty())
+                    workers[owner].links.emplace_back(keys.encode(f[0]),keys.encode(f[1]));
+            });
         });
-    });
-    filter.seal();
-    return filter;
-}
-
-inline void parse_events(const std::vector<Text>& chunks, const DuplicateFilter& filter, const Window& w,
-                         const Catalog& cat, People& people, std::vector<Worker>& workers) {
-    parallel(chunks.size(), workers.size(), [&](int worker, std::size_t i) {
-        auto& local = workers[worker];
-        lines(chunks[i], [&](Text line) {
-            std::array<Text, 7> f;
-            if (!fields(line, f) || f[0].empty()) return;
-            auto h = hash_text(f[0]);
-            bool repeat = filter.possible(h);
-            I64 ingest = timestamp(f[3]), ts = timestamp(f[2]);
-            Event ev{ts, absent, 0, 0};
-            bool valid = ts >= w.start && ts < w.end && ingest != bad_time && ingest <= ts + day_ms &&
-                         !f[1].empty() && !f[5].empty();
-            if (valid && f[4] == "purchase") {
-                ev.price = price_cents(f[6]); valid = ev.price > 0;
-                auto found = cat.product_category.find(f[5]);
-                if (found != cat.product_category.end()) ev.category = found->second;
-            } else if (f[4] != "view" && f[4] != "cart") valid = false;
-            if (valid) ev.person = local.person(f[1], people);
-            if (repeat) local.repeats[h % shards].push_back({f[0], ingest, ev});
-            else if (valid) local.events[ev.person % shards].push_back(ev);
-        });
-    });
-}
-
-inline void reduce_repeats(std::vector<Worker>& workers) {
-    parallel(shards, workers.size(), [&](int owner, std::size_t b) {
-        std::unordered_map<Text, const Candidate*> winners;
-        std::size_t count = 0;
-        for (auto& w : workers) count += w.repeats[b].size();
-        winners.reserve(count);
-        for (auto& w : workers) for (auto& row : w.repeats[b]) {
-            auto [it, inserted] = winners.try_emplace(row.id, &row);
-            if (!inserted && row.ingest < it->second->ingest) it->second = &row;
+        // Other workers may intern new strings while the link task runs.
+        const auto link_strings=keys.overflow();
+        auto events=files.add(path/"events"), clicks=files.add(path/"clicks");
+        std::size_t click_bytes=0;
+        for (auto s:clicks) click_bytes+=s.size();
+        for (auto& local:workers) {
+            for (auto& bin:local.clicks) bin.reserve(click_bytes/(38ULL*n*shards));
         }
-        for (auto& entry : winners) {
-            auto& ev = entry.second->event;
-            if (ev.person != absent) workers[owner].events[ev.person % shards].push_back(ev);
-        }
-        for (auto& w : workers) std::vector<Candidate>{}.swap(w.repeats[b]);
-    });
-}
-
-inline void parse_clicks(const std::vector<Text>& chunks, const Window& w, const Catalog& cat,
-                         People& people, std::vector<Worker>& workers) {
-    parallel(chunks.size(), workers.size(), [&](int worker, std::size_t i) {
-        auto& local = workers[worker];
-        lines(chunks[i], [&](Text line) {
-            std::array<Text, 4> f;
-            if (!fields(line, f) || f[0].empty() || f[1].empty()) return;
-            I64 ts = timestamp(f[3]);
-            if (ts < w.start - week_ms || ts >= w.end) return;
-            auto found = cat.campaign_id.find(f[2]);
-            if (found == cat.campaign_id.end()) return;
-            Id p = local.person(f[1], people);
-            local.clicks[p % shards].push_back({f[0], ts, p, found->second});
+        parallel(1+events.size()+clicks.size(),n,[&](int owner,std::size_t j){
+            if (!j) { resolve_links(link_strings); return; }
+            --j;
+            if (j<events.size()) {
+                csv_rows<7>(events[j],[&](auto& f){
+                    Key id=keys.encode(f[0]);
+                    if (!id) return;
+                    I64 ingest=dates.parse(f[3]), ts=dates.parse(f[2]);
+                    Event e{};
+                    bool valid=ts>=w.start && ts<w.end && ingest!=bad_time && ingest<=ts+day_ms
+                               && !f[1].empty() && !f[5].empty();
+                    if (valid && f[4]=="purchase") {
+                        Id price=price_cents(f[6]);
+                        valid=price>0;
+                        if (valid) {
+                            auto it=cat.product_category.find(f[5]);
+                            e.sale=values.sale(price,it==cat.product_category.end()?0:it->second,owner);
+                        }
+                    } else if (f[4]!="view" && f[4]!="cart") valid=false;
+                    if (valid) { e.person=keys.encode(f[1]); e.ts=values.stamp(ts,owner); }
+                    workers[owner].candidates[mix(id)%id_shards].append(workers[owner].arena,{id,ingest,e});
+                });
+            } else {
+                csv_rows<4>(clicks[j-events.size()],[&](auto& f){
+                    if (f[0].empty() || f[1].empty()) return;
+                    I64 ts=dates.parse(f[3]);
+                    if (ts<w.start-week_ms || ts>=w.end) return;
+                    auto it=cat.campaign_id.find(f[2]);
+                    if (it==cat.campaign_id.end()) return;
+                    Key k=keys.encode(f[1]);
+                    workers[owner].clicks[mix(k)%shards].push_back({k,keys.encode(f[0]),values.stamp(ts,owner),it->second});
+                });
+            }
         });
-    });
-}
-
-template<class T> std::vector<T> collect(std::vector<Worker>& workers, std::size_t shard,
-                                        std::array<std::vector<T>, shards> Worker::*member) {
-    std::vector<T> all;
-    std::size_t n = 0;
-    for (auto& w : workers) n += (w.*member)[shard].size();
-    all.reserve(n);
-    for (auto& w : workers) {
-        auto& part = (w.*member)[shard];
-        all.insert(all.end(), part.begin(), part.end());
-        std::vector<T>{}.swap(part);
     }
-    return all;
-}
+    void resolve_links(const std::vector<Text>& link_strings) {
+        std::size_t count=0;
+        for (auto& w:workers) count+=w.links.size();
+        people=std::make_unique<People>(count+count/2);
+        for (auto& w:workers) {
+            for (auto [a,b]:w.links) people->link(a,b,link_strings);
+            std::vector<std::pair<Key,Key>>{}.swap(w.links);
+        }
+        people->finish();
+    }
+    void distribute(std::vector<Worker>& sorted) {
+        parallel(id_shards,workers.size(),[&](int owner,std::size_t b){
+            std::size_t count=0;
+            for (auto& w:workers) count+=w.candidates[b].size();
+            auto capacity=std::bit_ceil(std::max<std::size_t>(8,count+count/2));
+            std::vector<std::uint64_t> slots(capacity);
+            std::array<CandidateBucket*,8> first{};
+            for (std::size_t t=0;t<workers.size();++t) first[t]=&workers[t].candidates[b];
+            for (unsigned t=0;t<workers.size();++t) {
+                auto& part=workers[t].candidates[b];
+                for (Id i=0;i<part.size();++i) {
+                    auto& row=part[i];
+                    auto h=mix(row.id);
+                    auto slot=(h>>std::countr_zero(id_shards))&(capacity-1);
+                    auto value=(h & 0xffffffff00000000ULL) | (1+8*i+t);
+                    for (;;) {
+                        auto old=slots[slot];
+                        if (!old) { slots[slot]=value; break; }
+                        if (((old^value)>>32)==0) {
+                            Id ref=Id(old)-1;
+                            auto& prior=(*first[ref%8])[ref/8];
+                            if (prior.id==row.id) {
+                                if (row.ingest<prior.ingest) { prior.event.person=0; slots[slot]=value; }
+                                else row.event.person=0;
+                                break;
+                            }
+                        }
+                        slot=(slot+1)&(capacity-1);
+                    }
+                }
+            }
+            for (auto& w:workers) {
+                auto& part=w.candidates[b];
+                for (std::size_t i=0;i<part.size();++i) {
+                    if (i+16<part.size()) people->prefetch(part[i+16].event.person);
+                    auto& e=part[i].event;
+                    if (!e.person) continue;
+                    e.person=people->canonical(e.person);
+                    sorted[owner].events[mix(e.person)%shards].push_back(e);
+                }
+            }
+        });
+        parallel(workers.size(),workers.size(),[&](int,std::size_t i){workers[i].arena.release();});
+        parallel(shards,workers.size(),[&](int owner,std::size_t b){
+            for (auto& w:workers) {
+                auto& part=w.clicks[b];
+                for (std::size_t i=0;i<part.size();++i) {
+                    if (i+16<part.size()) people->prefetch(part[i+16].person);
+                    auto& c=part[i];
+                    c.person=people->canonical(c.person);
+                    sorted[owner].clicks[mix(c.person)%shards].push_back(c);
+                }
+                std::vector<Click>{}.swap(part);
+            }
+        });
+    }
+};

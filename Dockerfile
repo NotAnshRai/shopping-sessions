@@ -1,7 +1,7 @@
 FROM python:3.12-bookworm@sha256:3c3ba8ad4c85eb63b7568f806434f14e33370056985da7fdf2673621cb1d7e93 AS build
 WORKDIR /src
 RUN pip install --no-cache-dir --no-deps pyarrow==19.0.1
-COPY main.cpp pipeline.hpp input.hpp output.hpp build.sh ./
+COPY main.cpp pipeline.hpp input.hpp output.hpp keys.hpp dates.hpp csv.hpp build.sh ./
 RUN set -eu; \
     mkdir -p /rootfs/app/lib /rootfs/tmp /rootfs/dev /rootfs/proc /rootfs/scratch /rootfs/output /rootfs/data; \
     sh build.sh /rootfs/app/shopping-sessions; \
